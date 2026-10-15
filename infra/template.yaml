@@ -7,9 +7,11 @@ Parameters:
   MedicalRegion: {Type: String, Default: ap-southeast-2}
   WorkerImageUri: {Type: String, Default: public.ecr.aws/docker/library/python:3.12-slim}
   EnableKinesis: {Type: String, Default: 'false', AllowedValues: ['true', 'false'], Description: Enable after Kinesis is activated for the AWS account}
+  EnableFullRds: {Type: String, Default: 'false', AllowedValues: ['true', 'false'], Description: Enable only on paid accounts; free-plan Aurora is created with RDS Express Configuration}
 
 Conditions:
   DeployKinesis: !Equals [!Ref EnableKinesis, 'true']
+  DeployFullRds: !Equals [!Ref EnableFullRds, 'true']
 
 Globals:
   Function:
@@ -58,35 +60,30 @@ Resources:
     Properties:
       Handler: index.handler
       InlineCode: |
-        import json, os, boto3
-        rds=boto3.client('rds-data')
-        def sql(q,p=[]):
-          return rds.execute_statement(resourceArn=os.environ['DB_CLUSTER_ARN'],secretArn=os.environ['DB_SECRET_ARN'],database='mediconnect',sql=q,parameters=p)
+        import json, os, uuid, boto3
+        from boto3.dynamodb.conditions import Key
+        table=boto3.resource('dynamodb').Table(os.environ['APPOINTMENTS_TABLE'])
         def out(code,body):
           return {'statusCode':code,'headers':{'content-type':'application/json','access-control-allow-origin':'*'},'body':json.dumps(body,default=str)}
         def handler(event,context):
           route=event.get('routeKey','')
           if route=='GET /health': return out(200,{'service':'mediconnect-api','status':'ok'})
-          sql("CREATE TABLE IF NOT EXISTS appointments (id BIGSERIAL PRIMARY KEY,patient_id VARCHAR(64) NOT NULL,doctor_name VARCHAR(120) NOT NULL,starts_at TIMESTAMPTZ NOT NULL,status VARCHAR(24) NOT NULL DEFAULT 'CONFIRMED',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
           claims=event.get('requestContext',{}).get('authorizer',{}).get('jwt',{}).get('claims',{})
           uid=claims.get('sub','demo-user')
           if route=='GET /appointments':
-            return out(200,sql('SELECT id,doctor_name,starts_at,status FROM appointments WHERE patient_id=:p ORDER BY starts_at',[{'name':'p','value':{'stringValue':uid}}]).get('records',[]))
+            return out(200,table.query(KeyConditionExpression=Key('patientId').eq(uid)).get('Items',[]))
           if route=='POST /appointments':
             b=json.loads(event.get('body') or '{}')
             if not b.get('doctorName') or not b.get('startsAt'): return out(400,{'message':'doctorName and startsAt are required'})
-            sql("INSERT INTO appointments(patient_id,doctor_name,starts_at,status) VALUES(:p,:d,:s,'CONFIRMED')",[{'name':'p','value':{'stringValue':uid}},{'name':'d','value':{'stringValue':b['doctorName']}},{'name':'s','value':{'stringValue':b['startsAt']}}])
-            return out(201,{'status':'CONFIRMED'})
+            item={'patientId':uid,'appointmentId':str(uuid.uuid4()),'doctorName':b['doctorName'],'startsAt':b['startsAt'],'status':'CONFIRMED'}
+            table.put_item(Item=item)
+            return out(201,item)
           return out(404,{'message':'Route not found'})
       Environment:
         Variables:
-          DB_CLUSTER_ARN: !GetAtt DatabaseCluster.DBClusterArn
-          DB_SECRET_ARN: !Ref DatabaseSecret
+          APPOINTMENTS_TABLE: !Ref AppointmentsTable
       Policies:
-        - Statement:
-            - Effect: Allow
-              Action: [rds-data:ExecuteStatement, secretsmanager:GetSecretValue]
-              Resource: ['*']
+        - DynamoDBCrudPolicy: {TableName: !Ref AppointmentsTable}
       Events:
         Health: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /health, Method: GET, Auth: {Authorizer: NONE}}}
         ListAppointments: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /appointments, Method: GET}}
@@ -101,6 +98,14 @@ Resources:
       KeySchema: [{AttributeName: patientId, KeyType: HASH}, {AttributeName: recordedAt, KeyType: RANGE}]
       TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
       PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  AppointmentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: patientId, AttributeType: S}, {AttributeName: appointmentId, AttributeType: S}]
+      KeySchema: [{AttributeName: patientId, KeyType: HASH}, {AttributeName: appointmentId, KeyType: RANGE}]
 
   VitalsStream:
     Type: AWS::Kinesis::Stream
@@ -209,14 +214,17 @@ Resources:
   RouteB: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref RouteTable}}
   DatabaseSubnets:
     Type: AWS::RDS::DBSubnetGroup
+    Condition: DeployFullRds
     Properties: {DBSubnetGroupDescription: MediConnect database subnets, SubnetIds: [!Ref PublicSubnetA, !Ref PublicSubnetB]}
   DatabaseSecret:
     Type: AWS::SecretsManager::Secret
+    Condition: DeployFullRds
     Properties:
       Description: MediConnect Aurora credentials
       GenerateSecretString: {SecretStringTemplate: '{"username":"mediconnect_admin"}', GenerateStringKey: password, PasswordLength: 32, ExcludeCharacters: '"@/\\'}
   DatabaseCluster:
     Type: AWS::RDS::DBCluster
+    Condition: DeployFullRds
     DeletionPolicy: Snapshot
     Properties:
       DatabaseName: mediconnect
@@ -232,6 +240,7 @@ Resources:
       BackupRetentionPeriod: 1
   DatabaseInstance:
     Type: AWS::RDS::DBInstance
+    Condition: DeployFullRds
     Properties: {DBClusterIdentifier: !Ref DatabaseCluster, DBInstanceClass: db.serverless, Engine: aurora-postgresql, PubliclyAccessible: false}
 
   FrontendBucket:
@@ -313,3 +322,4 @@ Outputs:
   IoTTopic: {Value: 'mediconnect/{deviceId}/vitals'}
   WorkerRepositoryUri: {Value: !GetAtt WorkerRepository.RepositoryUri}
   ReportBucketName: {Value: !Ref ReportBucket}
+  DatabaseMode: {Value: !If [DeployFullRds, 'CloudFormation Aurora Serverless v2', 'AWS free-plan RDS Express Configuration (created separately)']}

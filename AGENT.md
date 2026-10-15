@@ -15,7 +15,7 @@ This file is the live handoff for any agent continuing the project. Update the *
 
 ## Current status
 
-Last updated: 2026-10-16 00:10 IST
+Last updated: 2026-10-16 00:12 IST
 
 - Application code, infrastructure, README, license, tests, and worker are in this repository and pushed to `main`.
 - Unit tests: 2/2 passed. Vite production build passed.
@@ -24,7 +24,9 @@ Last updated: 2026-10-16 00:10 IST
 - AWS CloudFormation stack `mediconnect-dev` is `ROLLBACK_COMPLETE` after an early Cognito template validation error; the template was fixed.
 - AWS CloudFormation stack `mediconnect-dev-v2` is rolling back because this new/free-plan account rejected Kinesis with `The AWS Access Key Id needs a subscription for the service`.
 - Template has now been changed so `EnableKinesis=false` by default and IoT Core invokes the vitals Lambda directly. Kinesis remains ready behind an opt-in parameter for when the account subscription is activated.
-- Next deployment must use a new stack name such as `mediconnect-dev-v3` after `mediconnect-dev-v2` reaches `ROLLBACK_COMPLETE`.
+- `mediconnect-dev-v3` created Cognito, S3, DynamoDB, SNS, ECS/ECR, VPC and budget resources, but the AWS free plan rejected normal Aurora with `To use Aurora clusters with free plan accounts you need to set WithExpressConfiguration`; rollback started.
+- Official AWS documentation confirms `WithExpressConfiguration` is an RDS API/CLI/console-only creation flag and is not exposed by `AWS::RDS::DBCluster`. The next template uses DynamoDB for appointment runtime data, retains full Aurora resources behind `EnableFullRds=false`, and RDS Aurora Express must be created separately in the RDS console.
+- Next deployment must use `mediconnect-dev-v4` with `EnableKinesis=false` and `EnableFullRds=false`, followed by creation of an Aurora PostgreSQL Express cluster named `mediconnect-express`.
 
 ## Architecture target
 
@@ -49,7 +51,10 @@ Last updated: 2026-10-16 00:10 IST
 - [x] Attempt AWS deployment and diagnose the account-level Kinesis restriction.
 - [x] Add an optional-Kinesis/direct-IoT fallback to the template.
 - [ ] Validate and push the fallback template.
-- [ ] Create `mediconnect-dev-v3` in CloudFormation with `EnableKinesis=false`.
+- [x] Create `mediconnect-dev-v3` in CloudFormation with `EnableKinesis=false`.
+- [x] Diagnose the free-plan Aurora express-configuration requirement.
+- [ ] Create `mediconnect-dev-v4` with Kinesis and full-RDS conditions disabled.
+- [ ] Create the free-plan Aurora PostgreSQL express cluster separately and enable its Data API if available.
 - [ ] Fix any subsequent resource-specific failures and redeploy/update until `CREATE_COMPLETE`.
 - [ ] Upload the built frontend in `dist/` to the generated frontend S3 bucket.
 - [ ] Verify the public S3 website and API `/health` endpoint.
@@ -65,7 +70,7 @@ Last updated: 2026-10-16 00:10 IST
 2. Validate `infra/template.yaml`; run the test/build commands below.
 3. Commit the optional-Kinesis change and this handoff, then push `main`.
 4. Wait for `mediconnect-dev-v2` to reach `ROLLBACK_COMPLETE` in CloudFormation.
-5. Use CloudFormation Template Studio in `ap-south-1`, paste the raw GitHub template, validate it, and create stack `mediconnect-dev-v3` with IAM capabilities. Keep `EnableKinesis=false`.
+5. Use CloudFormation Template Studio in `ap-south-1`, paste the raw GitHub template, validate it, and create stack `mediconnect-dev-v4` with IAM capabilities. Keep `EnableKinesis=false` and `EnableFullRds=false`.
 6. Monitor Events until `CREATE_COMPLETE`. If a resource fails, record the exact event reason here, fix the template, push, and use `mediconnect-dev-v4` or update the active stack as appropriate.
 7. After success, copy every CloudFormation output into the final proof index and README.
 8. Upload `dist/index.html` and `dist/assets/*` to the frontend bucket, preserving paths and content types.
@@ -97,6 +102,8 @@ git remote -v
 - 2026-10-16 00:01 IST: `mediconnect-dev` failed template validation; fixed Cognito `Policies.PasswordPolicy` nesting.
 - 2026-10-16 00:04 IST: `mediconnect-dev-v2` started, then Kinesis failed because the account needs a service subscription; rollback began.
 - 2026-10-16 00:10 IST: Added `EnableKinesis` condition and direct IoT-to-Lambda fallback; created this continuation handoff.
+- 2026-10-16 00:10 IST: `mediconnect-dev-v3` created many resources, then rolled back because normal Aurora creation is prohibited on the free plan without the RDS API-only express flag.
+- 2026-10-16 00:12 IST: Added `EnableFullRds`, a DynamoDB appointment runtime fallback, and the documented separate RDS Express deployment path.
 
 ## Definition of done
 
