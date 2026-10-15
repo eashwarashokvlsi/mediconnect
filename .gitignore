@@ -10,4 +10,5 @@ __pycache__/
 cdk.out/
 coverage/
 *.log
+*.tsbuildinfo
 
