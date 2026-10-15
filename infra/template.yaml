@@ -23,7 +23,8 @@ Resources:
       UserPoolName: mediconnect-dev-users
       AutoVerifiedAttributes: [email]
       UsernameAttributes: [email]
-      PasswordPolicy: {MinimumLength: 10, RequireLowercase: true, RequireUppercase: true, RequireNumbers: true, RequireSymbols: true}
+      Policies:
+        PasswordPolicy: {MinimumLength: 10, RequireLowercase: true, RequireUppercase: true, RequireNumbers: true, RequireSymbols: true}
       Schema:
         - {Name: role, AttributeDataType: String, Mutable: true, Required: false}
   UserPoolClient:
