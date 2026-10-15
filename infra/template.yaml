@@ -6,6 +6,10 @@ Parameters:
   AlertEmail: {Type: String, Default: eashwarashokvlsi@gmail.com}
   MedicalRegion: {Type: String, Default: ap-southeast-2}
   WorkerImageUri: {Type: String, Default: public.ecr.aws/docker/library/python:3.12-slim}
+  EnableKinesis: {Type: String, Default: 'false', AllowedValues: ['true', 'false'], Description: Enable after Kinesis is activated for the AWS account}
+
+Conditions:
+  DeployKinesis: !Equals [!Ref EnableKinesis, 'true']
 
 Globals:
   Function:
@@ -100,6 +104,7 @@ Resources:
 
   VitalsStream:
     Type: AWS::Kinesis::Stream
+    Condition: DeployKinesis
     Properties: {StreamModeDetails: {StreamMode: ON_DEMAND}, RetentionPeriodHours: 24}
   AlertTopic:
     Type: AWS::SNS::Topic
@@ -137,8 +142,10 @@ Resources:
         limits={'heartRate':(50,120),'spo2':(94,100),'temperature':(35,38)}
         def handler(event,context):
           table=ddb.Table(os.environ['VITALS_TABLE']); count=0
-          for rec in event.get('Records',[]):
-            p=json.loads(base64.b64decode(rec['kinesis']['data'])); breaches=[]
+          records=event.get('Records',[])
+          payloads=[json.loads(base64.b64decode(r['kinesis']['data'])) for r in records] if records else [event]
+          for p in payloads:
+            breaches=[]
             for k,(lo,hi) in limits.items():
               v=float(p[k])
               if v<lo or v>hi: breaches.append({'metric':k,'value':v,'expected':[lo,hi]})
@@ -165,18 +172,12 @@ Resources:
         - SNSPublishMessagePolicy: {TopicName: !GetAtt AlertTopic.TopicName}
         - SQSSendMessagePolicy: {QueueName: !GetAtt ReportQueue.QueueName}
         - Statement: [{Effect: Allow, Action: [comprehendmedical:DetectEntitiesV2], Resource: '*'}]
-      Events:
-        KinesisBatch:
-          Type: Kinesis
-          Properties: {Stream: !GetAtt VitalsStream.Arn, StartingPosition: LATEST, BatchSize: 50, MaximumRetryAttempts: 2, BisectBatchOnFunctionError: true}
-
-  IoTRole:
-    Type: AWS::IAM::Role
+  IoTInvokePermission:
+    Type: AWS::Lambda::Permission
     Properties:
-      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: iot.amazonaws.com}, Action: sts:AssumeRole}]}
-      Policies:
-        - PolicyName: write-kinesis
-          PolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Action: kinesis:PutRecord, Resource: !GetAtt VitalsStream.Arn}]}
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref VitalsFunction
+      Principal: iot.amazonaws.com
   VitalsIoTRule:
     Type: AWS::IoT::TopicRule
     Properties:
@@ -184,7 +185,7 @@ Resources:
         AwsIotSqlVersion: '2016-03-23'
         RuleDisabled: false
         Sql: "SELECT * FROM 'mediconnect/+/vitals'"
-        Actions: [{Kinesis: {PartitionKey: '${topic(2)}', RoleArn: !GetAtt IoTRole.Arn, StreamName: !Ref VitalsStream}}]
+        Actions: [{Lambda: {FunctionArn: !GetAtt VitalsFunction.Arn}}]
 
   VPC:
     Type: AWS::EC2::VPC
@@ -308,7 +309,7 @@ Outputs:
   FrontendUrl: {Value: !GetAtt FrontendBucket.WebsiteURL}
   UserPoolId: {Value: !Ref UserPool}
   UserPoolClientId: {Value: !Ref UserPoolClient}
-  StreamName: {Value: !Ref VitalsStream}
+  StreamName: {Value: !If [DeployKinesis, !Ref VitalsStream, 'Unavailable until Kinesis is activated for this account']}
   IoTTopic: {Value: 'mediconnect/{deviceId}/vitals'}
   WorkerRepositoryUri: {Value: !GetAtt WorkerRepository.RepositoryUri}
   ReportBucketName: {Value: !Ref ReportBucket}
