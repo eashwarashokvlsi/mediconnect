@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: MediConnect academic demo - synthetic data only
+
+Parameters:
+  AlertEmail: {Type: String, Default: eashwarashokvlsi@gmail.com}
+  MedicalRegion: {Type: String, Default: ap-southeast-2}
+  WorkerImageUri: {Type: String, Default: public.ecr.aws/docker/library/python:3.12-slim}
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 30
+    Tracing: Active
+    Environment:
+      Variables: {APP_ORIGIN: '*'}
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: mediconnect-dev-users
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      PasswordPolicy: {MinimumLength: 10, RequireLowercase: true, RequireUppercase: true, RequireNumbers: true, RequireSymbols: true}
+      Schema:
+        - {Name: role, AttributeDataType: String, Mutable: true, Required: false}
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: mediconnect-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+      CorsConfiguration: {AllowOrigins: ['*'], AllowHeaders: [authorization, content-type], AllowMethods: [GET, POST, OPTIONS]}
+      Auth:
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: '$request.header.Authorization'
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              audience: [!Ref UserPoolClient]
+        DefaultAuthorizer: CognitoJwt
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: api_handler.handler
+      Environment:
+        Variables:
+          DB_CLUSTER_ARN: !GetAtt DatabaseCluster.DBClusterArn
+          DB_SECRET_ARN: !Ref DatabaseSecret
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [rds-data:ExecuteStatement, secretsmanager:GetSecretValue]
+              Resource: ['*']
+      Events:
+        Health: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /health, Method: GET, Auth: {Authorizer: NONE}}}
+        ListAppointments: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /appointments, Method: GET}}
+        CreateAppointment: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /appointments, Method: POST}}
+
+  VitalsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: patientId, AttributeType: S}, {AttributeName: recordedAt, AttributeType: N}]
+      KeySchema: [{AttributeName: patientId, KeyType: HASH}, {AttributeName: recordedAt, KeyType: RANGE}]
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  VitalsStream:
+    Type: AWS::Kinesis::Stream
+    Properties: {StreamModeDetails: {StreamMode: ON_DEMAND}, RetentionPeriodHours: 24}
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties: {DisplayName: MediConnect Alerts, KmsMasterKeyId: alias/aws/sns}
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties: {Protocol: email, Endpoint: !Ref AlertEmail, TopicArn: !Ref AlertTopic}
+  ReportDLQ:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+  ReportQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt ReportDLQ.Arn, maxReceiveCount: 3}
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      LifecycleConfiguration: {Rules: [{Id: archive, Status: Enabled, Transitions: [{StorageClass: STANDARD_IA, TransitionInDays: 30}]}]}
+
+  VitalsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: vitals_handler.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          VITALS_TABLE: !Ref VitalsTable
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          REPORT_QUEUE_URL: !Ref ReportQueue
+          MEDICAL_REGION: !Ref MedicalRegion
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref VitalsTable}
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt AlertTopic.TopicName}
+        - SQSSendMessagePolicy: {QueueName: !GetAtt ReportQueue.QueueName}
+        - Statement: [{Effect: Allow, Action: [comprehendmedical:DetectEntitiesV2], Resource: '*'}]
+      Events:
+        KinesisBatch:
+          Type: Kinesis
+          Properties: {Stream: !GetAtt VitalsStream.Arn, StartingPosition: LATEST, BatchSize: 50, MaximumRetryAttempts: 2, BisectBatchOnFunctionError: true}
+
+  IoTRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: iot.amazonaws.com}, Action: sts:AssumeRole}]}
+      Policies:
+        - PolicyName: write-kinesis
+          PolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Action: kinesis:PutRecord, Resource: !GetAtt VitalsStream.Arn}]}
+  VitalsIoTRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      TopicRulePayload:
+        AwsIotSqlVersion: '2016-03-23'
+        RuleDisabled: false
+        Sql: "SELECT * FROM 'mediconnect/+/vitals'"
+        Actions: [{Kinesis: {PartitionKey: '${topic(2)}', RoleArn: !GetAtt IoTRole.Arn, StreamName: !Ref VitalsStream}}]
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties: {CidrBlock: 10.42.0.0/16, EnableDnsHostnames: true, EnableDnsSupport: true, Tags: [{Key: Name, Value: mediconnect-dev}]}
+  InternetGateway: {Type: AWS::EC2::InternetGateway}
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref InternetGateway}
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.42.1.0/24, AvailabilityZone: !Select [0, !GetAZs ''], MapPublicIpOnLaunch: true}
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.42.2.0/24, AvailabilityZone: !Select [1, !GetAZs ''], MapPublicIpOnLaunch: true}
+  RouteTable: {Type: AWS::EC2::RouteTable, Properties: {VpcId: !Ref VPC}}
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties: {RouteTableId: !Ref RouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway}
+  RouteA: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref RouteTable}}
+  RouteB: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref RouteTable}}
+  DatabaseSubnets:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties: {DBSubnetGroupDescription: MediConnect database subnets, SubnetIds: [!Ref PublicSubnetA, !Ref PublicSubnetB]}
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: MediConnect Aurora credentials
+      GenerateSecretString: {SecretStringTemplate: '{"username":"mediconnect_admin"}', GenerateStringKey: password, PasswordLength: 32, ExcludeCharacters: '"@/\\'}
+  DatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DatabaseName: mediconnect
+      DBSubnetGroupName: !Ref DatabaseSubnets
+      Engine: aurora-postgresql
+      EngineMode: provisioned
+      EnableHttpEndpoint: true
+      ManageMasterUserPassword: false
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}'
+      ServerlessV2ScalingConfiguration: {MinCapacity: 0, MaxCapacity: 1}
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties: {DBClusterIdentifier: !Ref DatabaseCluster, DBInstanceClass: db.serverless, Engine: aurora-postgresql, PubliclyAccessible: false}
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      WebsiteConfiguration: {IndexDocument: index.html, ErrorDocument: index.html}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: false, BlockPublicPolicy: false, IgnorePublicAcls: false, RestrictPublicBuckets: false}
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: '*', Action: s3:GetObject, Resource: !Sub '${FrontendBucket.Arn}/*'}]}
+
+  WorkerRepository:
+    Type: AWS::ECR::Repository
+    Properties: {RepositoryName: mediconnect-report-worker, ImageScanningConfiguration: {ScanOnPush: true}, ImageTagMutability: IMMUTABLE}
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties: {ClusterName: mediconnect-dev}
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /ecs/mediconnect-report-worker, RetentionInDays: 7}
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}]}
+      Policies:
+        - PolicyName: report-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:ChangeMessageVisibility', 'sqs:GetQueueAttributes'], Resource: !GetAtt ReportQueue.Arn}
+              - {Effect: Allow, Action: 's3:PutObject', Resource: !Sub '${ReportBucket.Arn}/incidents/*'}
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: mediconnect-report-worker
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt WorkerRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Ref WorkerImageUri
+          Essential: true
+          Environment: [{Name: REPORT_QUEUE_URL, Value: !Ref ReportQueue}, {Name: REPORT_BUCKET, Value: !Ref ReportBucket}, {Name: RUN_ONCE, Value: 'true'}]
+          LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref WorkerLogGroup, awslogs-region: !Ref 'AWS::Region', awslogs-stream-prefix: worker}}
+
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: {AlarmDescription: MediConnect API Lambda errors, Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref ApiFunction}], Statistic: Sum, Period: 300, EvaluationPeriods: 1, Threshold: 1, ComparisonOperator: GreaterThanOrEqualToThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic]}
+  QueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: {AlarmDescription: Incident reports waiting, Namespace: AWS/SQS, MetricName: ApproximateNumberOfMessagesVisible, Dimensions: [{Name: QueueName, Value: !GetAtt ReportQueue.QueueName}], Statistic: Maximum, Period: 300, EvaluationPeriods: 1, Threshold: 5, ComparisonOperator: GreaterThanThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref AlertTopic]}
+  ProjectBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget: {BudgetName: mediconnect-monthly-cap, BudgetLimit: {Amount: 15, Unit: USD}, BudgetType: COST, TimeUnit: MONTHLY}
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlertEmail}]
+        - Notification: {NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlertEmail}]
+
+Outputs:
+  ApiUrl: {Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod'}
+  FrontendUrl: {Value: !GetAtt FrontendBucket.WebsiteURL}
+  UserPoolId: {Value: !Ref UserPool}
+  UserPoolClientId: {Value: !Ref UserPoolClient}
+  StreamName: {Value: !Ref VitalsStream}
+  IoTTopic: {Value: mediconnect/{deviceId}/vitals}
+  WorkerRepositoryUri: {Value: !GetAtt WorkerRepository.RepositoryUri}
+  ReportBucketName: {Value: !Ref ReportBucket}
