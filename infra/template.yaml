@@ -51,8 +51,28 @@ Resources:
   ApiFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: ../backend/
-      Handler: api_handler.handler
+      Handler: index.handler
+      InlineCode: |
+        import json, os, boto3
+        rds=boto3.client('rds-data')
+        def sql(q,p=[]):
+          return rds.execute_statement(resourceArn=os.environ['DB_CLUSTER_ARN'],secretArn=os.environ['DB_SECRET_ARN'],database='mediconnect',sql=q,parameters=p)
+        def out(code,body):
+          return {'statusCode':code,'headers':{'content-type':'application/json','access-control-allow-origin':'*'},'body':json.dumps(body,default=str)}
+        def handler(event,context):
+          route=event.get('routeKey','')
+          if route=='GET /health': return out(200,{'service':'mediconnect-api','status':'ok'})
+          sql("CREATE TABLE IF NOT EXISTS appointments (id BIGSERIAL PRIMARY KEY,patient_id VARCHAR(64) NOT NULL,doctor_name VARCHAR(120) NOT NULL,starts_at TIMESTAMPTZ NOT NULL,status VARCHAR(24) NOT NULL DEFAULT 'CONFIRMED',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+          claims=event.get('requestContext',{}).get('authorizer',{}).get('jwt',{}).get('claims',{})
+          uid=claims.get('sub','demo-user')
+          if route=='GET /appointments':
+            return out(200,sql('SELECT id,doctor_name,starts_at,status FROM appointments WHERE patient_id=:p ORDER BY starts_at',[{'name':'p','value':{'stringValue':uid}}]).get('records',[]))
+          if route=='POST /appointments':
+            b=json.loads(event.get('body') or '{}')
+            if not b.get('doctorName') or not b.get('startsAt'): return out(400,{'message':'doctorName and startsAt are required'})
+            sql("INSERT INTO appointments(patient_id,doctor_name,starts_at,status) VALUES(:p,:d,:s,'CONFIRMED')",[{'name':'p','value':{'stringValue':uid}},{'name':'d','value':{'stringValue':b['doctorName']}},{'name':'s','value':{'stringValue':b['startsAt']}}])
+            return out(201,{'status':'CONFIRMED'})
+          return out(404,{'message':'Route not found'})
       Environment:
         Variables:
           DB_CLUSTER_ARN: !GetAtt DatabaseCluster.DBClusterArn
@@ -107,8 +127,31 @@ Resources:
   VitalsFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: ../backend/
-      Handler: vitals_handler.handler
+      Handler: index.handler
+      InlineCode: |
+        import base64,json,os,time,uuid,boto3
+        from decimal import Decimal
+        ddb=boto3.resource('dynamodb'); sns=boto3.client('sns'); sqs=boto3.client('sqs')
+        medical=boto3.client('comprehendmedical',region_name=os.getenv('MEDICAL_REGION','ap-southeast-2'))
+        limits={'heartRate':(50,120),'spo2':(94,100),'temperature':(35,38)}
+        def handler(event,context):
+          table=ddb.Table(os.environ['VITALS_TABLE']); count=0
+          for rec in event.get('Records',[]):
+            p=json.loads(base64.b64decode(rec['kinesis']['data'])); breaches=[]
+            for k,(lo,hi) in limits.items():
+              v=float(p[k])
+              if v<lo or v>hi: breaches.append({'metric':k,'value':v,'expected':[lo,hi]})
+            item={**p,'patientId':p.get('patientId','demo-patient'),'readingId':p.get('readingId',str(uuid.uuid4())),'recordedAt':int(p.get('recordedAt',time.time())),'status':'ABNORMAL' if breaches else 'NORMAL','ttl':int(time.time())+7776000}
+            table.put_item(Item=json.loads(json.dumps(item),parse_float=Decimal))
+            if breaches:
+              entities=[]
+              if p.get('clinicalNote'): entities=medical.detect_entities_v2(Text=p['clinicalNote'][:20000]).get('Entities',[])
+              incident={'incidentId':str(uuid.uuid4()),'reading':item,'breaches':breaches,'medicalEntities':entities}
+              body=json.dumps(incident,default=str)
+              sns.publish(TopicArn=os.environ['ALERT_TOPIC_ARN'],Subject='MediConnect abnormal vital alert',Message=body)
+              sqs.send_message(QueueUrl=os.environ['REPORT_QUEUE_URL'],MessageBody=body)
+            count+=1
+          return {'processed':count}
       Timeout: 60
       Environment:
         Variables:
