@@ -308,6 +308,6 @@ Outputs:
   UserPoolId: {Value: !Ref UserPool}
   UserPoolClientId: {Value: !Ref UserPoolClient}
   StreamName: {Value: !Ref VitalsStream}
-  IoTTopic: {Value: mediconnect/{deviceId}/vitals}
+  IoTTopic: {Value: 'mediconnect/{deviceId}/vitals'}
   WorkerRepositoryUri: {Value: !GetAtt WorkerRepository.RepositoryUri}
   ReportBucketName: {Value: !Ref ReportBucket}
