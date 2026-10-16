@@ -15,7 +15,7 @@ This file is the live handoff for any agent continuing the project. Update the *
 
 ## Current status
 
-Last updated: 2026-10-16 00:12 IST
+Last updated: 2026-10-16 00:49 IST
 
 - Application code, infrastructure, README, license, tests, and worker are in this repository and pushed to `main`.
 - Unit tests: 2/2 passed. Vite production build passed.
@@ -26,7 +26,12 @@ Last updated: 2026-10-16 00:12 IST
 - Template has now been changed so `EnableKinesis=false` by default and IoT Core invokes the vitals Lambda directly. Kinesis remains ready behind an opt-in parameter for when the account subscription is activated.
 - `mediconnect-dev-v3` created Cognito, S3, DynamoDB, SNS, ECS/ECR, VPC and budget resources, but the AWS free plan rejected normal Aurora with `To use Aurora clusters with free plan accounts you need to set WithExpressConfiguration`; rollback started.
 - Official AWS documentation confirms `WithExpressConfiguration` is an RDS API/CLI/console-only creation flag and is not exposed by `AWS::RDS::DBCluster`. The next template uses DynamoDB for appointment runtime data, retains full Aurora resources behind `EnableFullRds=false`, and RDS Aurora Express must be created separately in the RDS console.
-- Next deployment must use `mediconnect-dev-v4` with `EnableKinesis=false` and `EnableFullRds=false`, followed by creation of an Aurora PostgreSQL Express cluster named `mediconnect-express`.
+- AWS CloudFormation stack `mediconnect-dev-v4` reached `CREATE_COMPLETE` at 00:16 IST with Kinesis and full-RDS conditions disabled.
+- Live stack outputs: API `https://9w5sd7nqil.execute-api.ap-south-1.amazonaws.com/prod`, frontend `http://mediconnect-dev-v4-frontendbucket-e7nhk2ftv3wi.s3-website.ap-south-1.amazonaws.com`, Cognito pool `ap-south-1_LThSWvZhi`, client `2dvf4phqo4l812q4b818f4rlql`, report bucket `mediconnect-dev-v4-reportbucket-zt4ziguycljm`, ECR `670099380958.dkr.ecr.ap-south-1.amazonaws.com/mediconnect-report-worker`.
+- Frontend upload succeeded (3 files, 229.7 KB). The public dashboard and `GET /prod/health` are live and verified; the API returned `{"service":"mediconnect-api","status":"ok"}`.
+- Aurora PostgreSQL Express cluster `mediconnect-express` is available in Mumbai with one Serverless v2 writer, 0–4 ACUs, IAM authentication, and five-minute scale-to-zero.
+- Real console screenshots were saved for CloudFormation, Cognito, API Gateway, Lambda, RDS, IoT Core, DynamoDB, SNS, SQS, S3, ECS, ECR, CloudWatch, Budget, and the live frontend.
+- Final verification rerun passed: 2/2 Python unit tests and the Vite production build. Only commit/push and heartbeat pause remain.
 
 ## Architecture target
 
@@ -50,17 +55,17 @@ Last updated: 2026-10-16 00:12 IST
 - [x] Save a local frontend proof screenshot.
 - [x] Attempt AWS deployment and diagnose the account-level Kinesis restriction.
 - [x] Add an optional-Kinesis/direct-IoT fallback to the template.
-- [ ] Validate and push the fallback template.
+- [x] Validate and push the fallback template.
 - [x] Create `mediconnect-dev-v3` in CloudFormation with `EnableKinesis=false`.
 - [x] Diagnose the free-plan Aurora express-configuration requirement.
-- [ ] Create `mediconnect-dev-v4` with Kinesis and full-RDS conditions disabled.
-- [ ] Create the free-plan Aurora PostgreSQL express cluster separately and enable its Data API if available.
-- [ ] Fix any subsequent resource-specific failures and redeploy/update until `CREATE_COMPLETE`.
-- [ ] Upload the built frontend in `dist/` to the generated frontend S3 bucket.
-- [ ] Verify the public S3 website and API `/health` endpoint.
-- [ ] Verify representative AWS resources in CloudFormation and service consoles.
-- [ ] Save service-by-service deployment proof screenshots and a final proof index.
-- [ ] Update README with live URLs, final resource status, limitations, and cleanup instructions.
+- [x] Create `mediconnect-dev-v4` with Kinesis and full-RDS conditions disabled.
+- [x] Create the free-plan Aurora PostgreSQL express cluster separately (Express uses IAM authentication and the Internet access gateway).
+- [x] Fix subsequent resource-specific failures and deploy until `CREATE_COMPLETE`.
+- [x] Upload the built frontend in `dist/` to the generated frontend S3 bucket.
+- [x] Verify the public S3 website and API `/health` endpoint.
+- [x] Verify representative AWS resources in CloudFormation and service consoles.
+- [x] Save service-by-service deployment proof screenshots and a final proof index.
+- [x] Update README with live URLs, final resource status, limitations, and cleanup instructions.
 - [ ] Commit and push all final documentation and status.
 - [ ] Pause the continuation heartbeat automation after completion.
 
@@ -104,6 +109,11 @@ git remote -v
 - 2026-10-16 00:10 IST: Added `EnableKinesis` condition and direct IoT-to-Lambda fallback; created this continuation handoff.
 - 2026-10-16 00:10 IST: `mediconnect-dev-v3` created many resources, then rolled back because normal Aurora creation is prohibited on the free plan without the RDS API-only express flag.
 - 2026-10-16 00:12 IST: Added `EnableFullRds`, a DynamoDB appointment runtime fallback, and the documented separate RDS Express deployment path.
+- 2026-10-16 00:16 IST: `mediconnect-dev-v4` reached `CREATE_COMPLETE`; recorded nine CloudFormation outputs and moved to frontend upload/live verification.
+- 2026-10-16 00:24 IST: S3 upload succeeded for all three frontend artifacts; verified the public dashboard and API health endpoint live.
+- 2026-10-16 00:38 IST: Created Aurora Express `mediconnect-express`; AWS reported the cluster and writer available with 0–4 ACUs and five-minute auto-pause.
+- 2026-10-16 00:44 IST: Saved service-by-service AWS console screenshots plus live frontend/API proof under the output proof folder.
+- 2026-10-16 00:49 IST: Final verification passed (2/2 unit tests and Vite production build).
 
 ## Definition of done
 
